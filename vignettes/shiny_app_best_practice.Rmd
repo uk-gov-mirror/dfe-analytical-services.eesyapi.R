@@ -16,7 +16,7 @@ knitr::opts_chunk$set(
 
 This page shows you how to get data from the explore education statistics (EES) API in an R Shiny app without calling the API more often than you need to.
 
-Put your API calls in the `server()` function and cache the data calls with Shiny's `bindCache()`. A cache saves the result of a call, so if the same data is asked for again your app uses the saved copy instead of calling the API. The cache is shared by everyone using your app.
+Put your API calls in the `server()` function and cache the data calls with Shiny's `bindCache()`. A cache saves the result of a call, so if the same data is asked for again your app uses the saved copy instead of calling the API. The cache is shared by everyone using the same copy of your app. If your app runs on more than one server process, for example on shinyapps.io with several instances, each process has its own cache.
 
 Include the data set version in the cache key. When a new version is published, the key changes and your app gets the new data.
 
@@ -24,7 +24,7 @@ Your app should only update to new major versions of a data set when you've test
 
 ## Example app
 
-This app lets a user pick a location and a time period, and shows the number of pupil attendance sessions for that selection.
+This app lets a user pick a location and a week, and shows the number of pupil attendance sessions for that selection.
 
 ```{r example-app, eval = FALSE}
 library(shiny)
@@ -39,67 +39,77 @@ dataset_version <- paste0(major_version, ".*")
 ui <- fluidPage(
   titlePanel("Pupil attendance in schools"),
   fluidRow(
-    # Choices are filled in by the server once the metadata has loaded
+    # Choices are filled in by the server once the data has loaded
     column(4, selectInput("location", "Location:", choices = NULL)),
-    column(4, selectInput("time_period", "Time period:", choices = NULL))
+    column(4, selectInput("week", "Week:", choices = NULL))
   ),
-  # Lets the table scroll sideways if it's wider than the page
-  div(style = "overflow-x: auto;", tableOutput("attendance_table"))
+  tableOutput("attendance_table")
 )
 
 server <- function(input, output, session) {
-  # 1. Get the metadata, and the version number to use in the cache key
-  meta <- reactive({
-    meta_data <- get_meta(dataset_id, dataset_version = dataset_version)
-
+  # 1. Get the version number to use in the cache key
+  version <- reactive({
     versions <- get_dataset_versions(dataset_id)$version
     versions <- versions[startsWith(versions, paste0(major_version, "."))]
-    meta_data$version <- as.character(max(numeric_version(versions)))
-    meta_data
+    as.character(max(numeric_version(versions)))
   })
 
-  observe({
-    locations <- meta()$locations
-    time_periods <- meta()$time_periods
-
-    updateSelectInput(
-      session, "location",
-      choices = setNames(
-        paste(locations$geographic_level_code, "id", locations$item_id, sep = "|"),
-        locations$label
-      )
-    )
-    updateSelectInput(
-      session, "time_period",
-      choices = setNames(
-        paste(time_periods$period, time_periods$code, sep = "|"),
-        time_periods$label
-      )
-    )
-  })
-
-  # 2. Get the data for the user's selection, cached by version and selection
+  # 2. Get all the data the app can show in one call, cached by version
   attendance_data <- reactive({
-    req(input$location, input$time_period)
+    meta <- get_meta(dataset_id, dataset_version = dataset_version)
+    indicators <- meta$indicators
+    filters <- meta$filter_items
+    filter_id <- function(column, label) {
+      filters$item_id[filters$col_name == column & filters$item_label == label]
+    }
 
-    indicators <- meta()$indicators
-    query_dataset(
+    data <- query_dataset(
       dataset_id,
       dataset_version = dataset_version,
       indicators = indicators$col_id[indicators$col_name == "session_count"],
-      geographies = input$location,
-      time_periods = input$time_period
+      filter_items = list(
+        attendance_reason = filter_id("attendance_reason", "Overall attendance"),
+        education_phase = filter_id("education_phase", "All schools"),
+        time_frame = filter_id("time_frame", "Week")
+      )
     )
-  }) |>
-    bindCache(meta()$version, input$location, input$time_period)
 
-  # 3. Show the data, or a message if there isn't any
+    # Add one column for the location name and one for the week
+    data$location <- dplyr::coalesce(data$la_name, data$reg_name, data$nat_name)
+    data$week <- paste(data$time_period, data$time_identifier)
+    data
+  }) |>
+    bindCache(version())
+
+  # 3. Fill in the drop-downs from the data
+  observe({
+    data <- attendance_data()
+    locations <- unique(data[c("geographic_level", "location")])
+    levels <- factor(
+      locations$geographic_level,
+      levels = c("National", "Regional", "Local authority")
+    )
+
+    updateSelectInput(
+      session, "location",
+      choices = split(locations$location, levels)
+    )
+    updateSelectInput(session, "week", choices = unique(data$week))
+  })
+
+  # 4. Filter the data to the user's selection, or show a message if there isn't any
   output$attendance_table <- renderTable({
-    validate(need(
-      nrow(attendance_data()) > 0,
-      "There is no data for this selection."
-    ))
-    attendance_data()
+    req(input$location, input$week)
+    data <- attendance_data()
+    selected <- data[data$location == input$location & data$week == input$week, ]
+    validate(need(nrow(selected) > 0, "There is no data for this selection."))
+
+    data.frame(
+      Location = selected$location,
+      Week = selected$week,
+      `Number of sessions` = prettyNum(selected$session_count, big.mark = ","),
+      check.names = FALSE
+    )
   })
 }
 
@@ -108,34 +118,64 @@ shinyApp(ui, server)
 
 ## How it works
 
-### 1. Get the metadata and version number
+### 1. Get the version number
 
-`get_meta()` gets the metadata for the latest version 3 of the data set: the locations, time periods, filters and indicators, and the IDs the API uses for them. The app uses it to fill in the drop-down menus.
+`get_dataset_versions()` lists every version of the data set. The app picks the latest version 3 from that list, for example `3.20`, to use as the cache key.
 
-`get_dataset_versions()` lists every version of the data set. The app picks the latest version 3 from that list, for example `3.20`, and saves it with the metadata to use in the data call's cache key.
+This call is small and quick, so it isn't cached. It runs each time someone opens the app, so the next person to open it after a new version is published gets the new data.
 
-These two calls are small and quick, so they aren't cached. They run each time someone opens the app, so the next person to open it after a new version is published gets the new data.
+### 2. Get all the data the app needs in one call
 
-`query_dataset()` needs locations and time periods in these formats, which the app builds from the metadata:
+The app gets everything it could ever show in one call to `query_dataset()`, then filters that data in memory when the user changes a drop-down. Changing a drop-down doesn't call the API, so the table updates straight away.
 
-- locations as `"LEVEL|id|item_id"`, for example `"LA|id|rQkNj"`
-- time periods as `"period|code"`, for example `"2026|W37"`
+`get_meta()` gets the IDs the API uses for the indicator and filters. The app looks up the IDs by their labels, instead of typing the IDs into the code, so it doesn't rely on IDs that could change between versions.
 
-See `?query_dataset` for more on these formats.
+The filters narrow the data down to overall attendance in all schools across the whole week. When you give `filter_items` as a list, you only get rows that match all of the filters. See `?query_dataset` for more on this.
 
-### 2. Get the data
+Leaving out `geographies` and `time_periods` gets every location and week. For version 3.20 that's about 6,000 rows, or 1 MB, and it takes a couple of seconds to download.
 
-`query_dataset()` only asks for the rows that match the user's selection, so each call is quick and your app never holds the whole data set.
+The cache key is just the version, so each copy of your app only calls the API once for each version of the data set.
 
-The cache key is the version and both selections. If anyone has already picked the same location and time period, the app uses the saved data.
+The app also adds a `location` column, which takes the name from `la_name`, `reg_name` or `nat_name` depending on the row's level, and a `week` column, for example `"2026 Week 29"`.
 
-Make sure everything that changes the result of a query is in its cache key. If you add another drop-down, add its input to `bindCache()` too, or users could see data for the wrong selection.
+#### When to query for each selection instead
 
-`req()` stops the query running until both drop-downs have a value.
+Only get all the data at once if it's small enough to hold in memory. This example only works because the filters shrink a data set of nearly 7 million rows down to about 6,000.
 
-### 3. Tell the user when there is no data
+If users can choose from a lot more data, for example any attendance reason, school phase and day of the week, query the API for each selection instead:
 
-`validate(need(...))` shows a message instead of an empty table.
+- pass the user's choices to `query_dataset()` using `geographies`, `time_periods` and `filter_items`
+- put every input that changes the query in `bindCache()`, as well as the version, or users could see data for the wrong selection
+
+```{r per-selection, eval = FALSE}
+attendance_data <- reactive({
+  req(input$location, input$week, input$reason)
+
+  query_dataset(
+    dataset_id,
+    dataset_version = dataset_version,
+    indicators = session_count_id,
+    geographies = input$location, # for example "LA|id|rQkNj"
+    time_periods = input$week, # for example "2026|W29"
+    filter_items = list(attendance_reason = input$reason)
+  )
+}) |>
+  bindCache(version(), input$location, input$week, input$reason)
+```
+
+Here the drop-down values are the IDs the API uses, not labels. You can get them, and `session_count_id`, from `get_meta()`. See `?query_dataset` for the formats it needs.
+
+### 3. Fill in the drop-downs
+
+The drop-down choices come from the data, so they only list locations and weeks that have data. Locations are grouped by level, with England first, then regions, then local authorities.
+
+### 4. Filter the data and show it
+
+`req()` stops the table showing until both drop-downs have a value.
+
+The app filters the data to the chosen location and week. Some locations don't have data for every week, so `validate(need(...))` shows a message instead of an empty table.
+
+The table only shows the location, week and number of sessions, so it's easy to read. The data from `query_dataset()` has more columns, such as location codes and filter labels, if you need them.
 
 ## Data set versions
 
